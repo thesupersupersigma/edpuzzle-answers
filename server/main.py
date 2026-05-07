@@ -48,7 +48,21 @@ if config["gzip_responses"]:
   Compress(app)
 else:
   print("Response compression disabled.")
-CORS(app)
+
+# --- APPLIED CORS FIX ---
+# Specifically allow Edpuzzle to talk to your API endpoints
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": ["https://edpuzzle.com"],
+            "methods": ["GET", "POST", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization"],
+            "supports_credentials": True,
+        }
+    },
+)
+# ------------------------
 
 # flask proxy fix
 if config["behind_proxy"]:
@@ -76,7 +90,8 @@ def write_cache():
   cache_path.write_text(json.dumps(cache, indent=2))
 
 def create_session():
-  session = requests.Session(impersonate="chrome")
+  # UPDATED TO CHROME 110 TO BYPASS SOME TLS FINGERPRINTING
+  session = requests.Session(impersonate="chrome110")
   session.headers.update({
     "Content-Type": "application/json",
     "Referer": "https://edpuzzle.com/",
@@ -87,64 +102,75 @@ def create_session():
   return session
 
 def account_login(creds):
-  session = create_session()
   username = creds["username"]
+  
+  # --- ADDED TRY/EXCEPT BLOCK TO PREVENT GUNICORN CRASHES ---
+  try:
+      session = create_session()
 
-  # check if our current token is ok
-  current_token = current_tokens.get(username)
-  if current_token and time.time() - current_token[1] < 6 * 3600:
-    res = session.get("https://edpuzzle.com/api/v3/users/me", cookies={
-      "token": current_token[0]
-    })
+      # check if our current token is ok
+      current_token = current_tokens.get(username)
+      if current_token and time.time() - current_token[1] < 6 * 3600:
+        res = session.get("https://edpuzzle.com/api/v3/users/me", cookies={
+          "token": current_token[0]
+        }, timeout=15)
 
-    if res.ok:
-      return current_token[0]
-    print(f"token probably expired for {username}")
+        if res.ok:
+          return current_token[0]
+        print(f"token probably expired for {username}")
 
-  # Anti-cheat stuff
-  home_res = session.get("https://edpuzzle.com/")  # get csrf cookie and later anti-bot test
-  payload = {
-    "username": creds["username"],
-    "password": creds["password"],
-    "role": "teacher",
-  }
+      # Anti-cheat stuff
+      home_res = session.get("https://edpuzzle.com/", timeout=15)
+      payload = {
+        "username": creds["username"],
+        "password": creds["password"],
+        "role": "teacher",
+      }
 
-  # CSRF
-  csrf_res = session.get("https://edpuzzle.com/api/v3/csrf")
-  csrf_token = csrf_res.json()["CSRFToken"]
-  session.headers["X-Csrf-Token"] = csrf_token
+      # CSRF
+      csrf_res = session.get("https://edpuzzle.com/api/v3/csrf", timeout=15)
+      csrf_token = csrf_res.json()["CSRFToken"]
+      session.headers["X-Csrf-Token"] = csrf_token
 
-  # Web version anti-bot
-  # Credits to https://github.com/VillainsRule/Narwhal/blob/master/narwhal/narwhal.ts
-  # Explanation: this seems to generate a hash from the main edpuzzle.com page which is disguised as the version
-  md5 = hashlib.md5()
-  md5.update(json.dumps(payload, separators=(",", ":")).encode())
-  md5 = md5.hexdigest()[:4]
+      # Web version anti-bot
+      md5 = hashlib.md5()
+      md5.update(json.dumps(payload, separators=(",", ":")).encode())
+      md5 = md5.hexdigest()[:4]
 
-  decoded = home_res.text.replace(" ", "")
-  part = re.search(r'version:"(.*?)",', decoded).group(1)
-  multiplier = int(part.split(".")[2]) + 10
+      decoded = home_res.text.replace(" ", "")
+      part = re.search(r'version:"(.*?)",', decoded).group(1)
+      multiplier = int(part.split(".")[2]) + 10
 
-  anti_cheat_token = int(time.time()) * multiplier
-  session.headers["X-Edpuzzle-Web-Version"] = f"{part}.{md5}{anti_cheat_token}"
+      anti_cheat_token = int(time.time()) * multiplier
+      session.headers["X-Edpuzzle-Web-Version"] = f"{part}.{md5}{anti_cheat_token}"
 
-  login_res = session.post(
-    "https://edpuzzle.com/api/v3/users/login",
-    data=json.dumps(payload, separators=(",", ":")),
-    headers={
-      "Content-Type": "application/json"
-    }
-  )
-  if not login_res.ok:
-    print(f"warning: auth failed for {username}")
-    if username in current_tokens:
-      del current_tokens[username]
-    return
+      login_res = session.post(
+        "https://edpuzzle.com/api/v3/users/login",
+        data=json.dumps(payload, separators=(",", ":")),
+        headers={
+          "Content-Type": "application/json"
+        },
+        timeout=15
+      )
+      
+      if not login_res.ok:
+        print(f"warning: auth failed for {username}. Status Code: {login_res.status_code}")
+        if username in current_tokens:
+          del current_tokens[username]
+        return
 
-  print(f"login success for {username}")
-  now = int(time.time())
-  current_tokens[username] = login_res.cookies.get("token"), now
-  write_cache()
+      print(f"login success for {username}")
+      now = int(time.time())
+      current_tokens[username] = login_res.cookies.get("token"), now
+      write_cache()
+      
+  except requests.exceptions.RequestException as e:
+      print(f"Network error during login for {username}: {e}")
+      return
+  except Exception as e:
+      print(f"Unexpected error during login for {username}: {e}")
+      return
+  # --------------------------------------------------------
 
 def token_refresher():
   write_cache()
